@@ -10,19 +10,23 @@
 use crate::client::{ClientContext, LoxoneClient, LoxoneStructure};
 use crate::config::ServerConfig;
 use crate::services::{StateManager, UnifiedValueResolver};
-use pulseengine_mcp_macros::{mcp_server, mcp_tools};
+use pulseengine_mcp_macros::mcp_tools;
+use pulseengine_mcp_server::{HasServerInfo, McpBackend, McpServerBuilder, McpToolsProvider, CommonMcpError};
+use pulseengine_mcp_protocol::{
+    CallToolRequestParam, CallToolResult, GetPromptRequestParam, GetPromptResult,
+    Implementation, ListPromptsResult, ListResourcesResult, ListToolsResult,
+    PaginatedRequestParam, ProtocolVersion, ReadResourceRequestParam, ReadResourceResult,
+    ServerCapabilities, ServerInfo, ToolsCapability,
+};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tracing::{info, warn};
 
 /// Loxone MCP Server with macro-based tool definitions
 ///
-/// This struct holds the context needed for tool execution and uses
-/// the `#[mcp_server]` macro for automatic backend generation.
-#[mcp_server(
-    name = "Loxone MCP Server",
-    description = "High-performance MCP server for Loxone home automation"
-)]
+/// This struct holds the context needed for tool execution.
+/// Manual trait implementations are used instead of #[mcp_server] to allow
+/// custom capabilities (list_changed: true).
 #[derive(Clone, Default)]
 #[allow(dead_code)]
 pub struct LoxoneMcpServer {
@@ -37,6 +41,110 @@ pub struct LoxoneMcpServer {
     /// Server configuration (for future use)
     config: Option<ServerConfig>,
 }
+
+impl HasServerInfo for LoxoneMcpServer {
+    fn server_info() -> ServerInfo {
+        ServerInfo {
+            protocol_version: ProtocolVersion::default(),
+            capabilities: ServerCapabilities {
+                tools: Some(ToolsCapability {
+                    list_changed: Some(true),
+                }),
+                resources: Some(pulseengine_mcp_protocol::ResourcesCapability {
+                    subscribe: Some(false),
+                    list_changed: Some(true),
+                }),
+                prompts: Some(pulseengine_mcp_protocol::PromptsCapability {
+                    list_changed: Some(true),
+                }),
+                logging: Some(pulseengine_mcp_protocol::LoggingCapability {
+                    level: Some("info".to_string()),
+                }),
+                sampling: None,
+                ..Default::default()
+            },
+            server_info: Implementation::new("Loxone MCP Server", env!("CARGO_PKG_VERSION")),
+            instructions: Some("High-performance MCP server for Loxone home automation".to_string()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl McpBackend for LoxoneMcpServer {
+    type Error = CommonMcpError;
+    type Config = ();
+
+    async fn initialize(_config: Self::Config) -> std::result::Result<Self, Self::Error> {
+        Ok(Self::default())
+    }
+
+    fn get_server_info(&self) -> ServerInfo {
+        <Self as HasServerInfo>::server_info()
+    }
+
+    async fn health_check(&self) -> std::result::Result<(), Self::Error> {
+        Ok(())
+    }
+
+    async fn list_tools(
+        &self,
+        _request: PaginatedRequestParam,
+    ) -> std::result::Result<ListToolsResult, Self::Error> {
+        let tools = <Self as McpToolsProvider>::get_available_tools(self);
+        Ok(ListToolsResult { tools, next_cursor: None })
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParam,
+    ) -> std::result::Result<CallToolResult, Self::Error> {
+        <Self as McpToolsProvider>::call_tool_impl(self, request.clone())
+            .await
+            .map_err(|e| CommonMcpError::InvalidParams(e.to_string()))
+    }
+
+    async fn list_resources(
+        &self,
+        _request: PaginatedRequestParam,
+    ) -> std::result::Result<ListResourcesResult, Self::Error> {
+        Ok(ListResourcesResult {
+            resources: vec![],
+            next_cursor: None,
+        })
+    }
+
+    async fn read_resource(
+        &self,
+        _request: ReadResourceRequestParam,
+    ) -> std::result::Result<ReadResourceResult, Self::Error> {
+        Err(CommonMcpError::InvalidParams(format!(
+            "Resource not found: {}",
+            _request.uri
+        )))
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: PaginatedRequestParam,
+    ) -> std::result::Result<ListPromptsResult, Self::Error> {
+        Ok(ListPromptsResult {
+            prompts: vec![],
+            next_cursor: None,
+        })
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParam,
+    ) -> std::result::Result<GetPromptResult, Self::Error> {
+        Err(CommonMcpError::InvalidParams(format!(
+            "Unknown prompt: {}",
+            request.name
+        )))
+    }
+}
+
+impl McpServerBuilder for LoxoneMcpServer {}
 
 impl LoxoneMcpServer {
     /// Create a new Loxone MCP server with all dependencies
@@ -55,6 +163,80 @@ impl LoxoneMcpServer {
             state_manager,
             config: Some(config),
         }
+    }
+
+    /// Serve using STDIO transport
+    pub async fn serve_stdio(self) -> std::result::Result<pulseengine_mcp_server::McpServer<Self>, CommonMcpError> {
+        use pulseengine_mcp_server::{McpServer, ServerConfig, TransportConfig};
+
+        let mut config = ServerConfig::default();
+        config.transport_config = TransportConfig::Stdio;
+        config.server_info = <Self as HasServerInfo>::server_info();
+
+        let mut auth_config = pulseengine_mcp_server::auth::AuthConfig::memory();
+        auth_config.enabled = false;
+        config.auth_config = auth_config;
+
+        let server = McpServer::new(self, config).await.map_err(|e| {
+            CommonMcpError::Internal(format!("Failed to create server: {e}"))
+        })?;
+
+        Ok(server)
+    }
+
+    /// Serve using HTTP (Streamable HTTP) transport
+    pub async fn serve_http(self, port: u16) -> std::result::Result<pulseengine_mcp_server::McpServer<Self>, CommonMcpError> {
+        use pulseengine_mcp_server::{McpServer, ServerConfig, TransportConfig};
+
+        let mut config = ServerConfig::default();
+        config.transport_config = TransportConfig::StreamableHttp {
+            port,
+            host: None,
+        };
+        config.server_info = <Self as HasServerInfo>::server_info();
+
+        let mut auth_config = pulseengine_mcp_server::auth::AuthConfig::memory();
+        auth_config.enabled = false;
+        config.auth_config = auth_config;
+
+        let server = McpServer::new(self, config).await.map_err(|e| {
+            CommonMcpError::Internal(format!("Failed to create server: {e}"))
+        })?;
+
+        Ok(server)
+    }
+
+    /// Serve using WebSocket transport
+    pub async fn serve_websocket(self, port: u16) -> std::result::Result<pulseengine_mcp_server::McpServer<Self>, CommonMcpError> {
+        use pulseengine_mcp_server::{McpServer, ServerConfig, TransportConfig};
+
+        let mut config = ServerConfig::default();
+        config.transport_config = TransportConfig::WebSocket {
+            port,
+            host: None,
+        };
+        config.server_info = <Self as HasServerInfo>::server_info();
+
+        let mut auth_config = pulseengine_mcp_server::auth::AuthConfig::memory();
+        auth_config.enabled = false;
+        config.auth_config = auth_config;
+
+        let server = McpServer::new(self, config).await.map_err(|e| {
+            CommonMcpError::Internal(format!("Failed to create server: {e}"))
+        })?;
+
+        Ok(server)
+    }
+
+    /// Build a server with custom configuration
+    pub async fn build_server(self, config: pulseengine_mcp_server::ServerConfig) -> std::result::Result<pulseengine_mcp_server::McpServer<Self>, CommonMcpError> {
+        use pulseengine_mcp_server::McpServer;
+
+        let server = McpServer::new(self, config).await.map_err(|e| {
+            CommonMcpError::Internal(format!("Failed to create server: {e}"))
+        })?;
+
+        Ok(server)
     }
 
     /// Check if connected to Loxone

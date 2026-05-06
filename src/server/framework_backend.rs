@@ -83,7 +83,7 @@ impl McpBackend for LoxoneFrameworkBackend {
                 prompts: None,
                 resources: None,
                 tools: Some(ToolsCapability {
-                    list_changed: Some(false),
+                    list_changed: Some(true),
                 }),
                 // Enable sampling capability - allows server-initiated LLM calls
                 sampling: Some(pulseengine_mcp_protocol::SamplingCapability {

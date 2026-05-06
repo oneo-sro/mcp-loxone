@@ -343,7 +343,7 @@ impl HttpTransportServer {
 
         // Initialize unified authentication manager
         let custom_auth = crate::auth::initialize_auth_system().await?;
-        
+
         // For now, use custom auth wrapped in UnifiedAuth
         // In the future, this can be replaced with framework auth or dual mode
         let auth_manager = Arc::new(UnifiedAuth::Custom(custom_auth));
@@ -410,7 +410,7 @@ impl HttpTransportServer {
         };
         Self::new(mcp_server, config).await
     }
-    
+
     /// Create with specific unified auth (for framework integration)
     pub async fn with_unified_auth(
         mcp_server: LoxoneMcpServer,
@@ -1247,7 +1247,7 @@ async fn handle_mcp_message(
                             "tools": {},
                             "resources": {
                                 "subscribe": false,
-                                "listChanged": false
+                                "listChanged": true
                             },
                             "prompts": {}
                         },
@@ -2621,7 +2621,7 @@ async fn admin_status(State(state): State<Arc<AppState>>, _headers: HeaderMap) -
             }
         }
     };
-    
+
     let status = serde_json::json!({
         "server": "running",
         "connections": 0, // TODO: Track active connections
@@ -2708,7 +2708,7 @@ async fn unified_auth_middleware_with_smart_errors(
 
     // Authenticate using unified auth - extract API key from headers/query
     let api_key = crate::auth::validation::extract_api_key(headers, query_string);
-    
+
     let authenticated = if let Some(key) = api_key {
         unified_auth.validate_api_key(&key).await.unwrap_or(false)
     } else {
